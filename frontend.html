@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Veil</title>
+<!--
+  VEIL — single-file proxy browser frontend. No build step, no dependencies.
+
+  BACKEND CONTRACT (JSON, bearer-token session: header  Authorization: Bearer <token>):
+  The user is ALWAYS taken from the session token, never from the request body.
+  POST   /api/auth/register {username,password}      -> 201
+  POST   /api/auth/login    {username,password}      -> {username, token, proxy_base}
+  POST   /api/auth/logout
+  GET    /api/auth/me                                -> {username, proxy_base}   (401 if signed out)
+  GET    /api/bookmarks -> [{id,name,url}]   POST {name,url} -> {id,name,url}
+  PATCH  /api/bookmarks/:id {name?,url?}     DELETE /api/bookmarks/:id
+  GET    /api/history -> [{id,url,title,domain,visited_at}]   POST {url,title}
+  DELETE /api/history/:id    DELETE /api/history (clear all)
+  GET    /api/settings -> {search_engine, preferences:{}}     PATCH {search_engine?, preferences?}
+  DELETE /api/site-data
+  GET    /api/proxy?url=<encoded>   -> proxied page (loaded in an iframe)
+         Non-GET proxied traffic is handled by the backend's rewriting of the page.
+  Errors: {error:"message"} with 401/429/etc.
+  Optional: the proxied page may call parent.postMessage({type:'proxy-nav',url,title},'*') when it
+  navigates, and {type:'proxy-error',code:'unreachable'|'timeout'|'blocked'} on failure.
+  The backend must allow CORS (Access-Control-Allow-Origin + the Authorization header) so this file
+  works from anywhere: file://, another website, or served by the backend itself.
+  TO SHARE THIS FILE: set DEFAULT_SERVER below to your backend's https address.
+-->
+<style>
+:root{--bg:#050505;--s1:#0d0d0e;--s2:#151516;--s3:#212123;--s4:#2e2e31;--line:rgba(255,255,255,.08);--tx:#ececec;--mut:#8b8b90;--r:12px;--ease:cubic-bezier(.2,.8,.2,1)}
+*{box-sizing:border-box;margin:0}
+html,body{height:100%;background:var(--bg);color:var(--tx);font:14px/1.45 "Inter","Segoe UI",system-ui,-apple-system,sans-serif;overflow:hidden}
+button,input,select{font:inherit;color:inherit}
+button{background:none;border:0;cursor:pointer}
+:focus-visible{outline:2px solid #fff6;outline-offset:2px}
+.hidden{display:none!important}
+.ic svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;display:block}
+.ib{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;color:var(--mut);transition:.18s var(--ease);flex:none}
+.ib:hover:not(:disabled){background:var(--s3);color:#fff}.ib:disabled{opacity:.3;cursor:default}
+.ib.on svg{fill:#fff;stroke:#fff}
+.btn{padding:9px 16px;border-radius:10px;background:var(--s3);transition:.18s var(--ease)}
+.btn:hover{background:var(--s4)}
+.btn.pri{background:#f2f2f2;color:#000;font-weight:600}.btn.pri:hover{background:#fff}
+.btn.dng{color:#ff8f8f}
+input[type=text],input[type=password],input[type=url],select{width:100%;background:var(--s1);border:1px solid var(--line);border-radius:10px;padding:10px 12px;outline:0;transition:.18s}
+input:focus,select:focus{border-color:#fff4;background:var(--s2)}
+select option{background:#111}
+
+/* auth */
+#auth{position:fixed;inset:0;display:grid;place-items:center;background:radial-gradient(900px 500px at 50% -10%,#1a1a1c,var(--bg) 70%);z-index:50}
+.card{width:min(380px,92vw);background:linear-gradient(180deg,var(--s2),var(--s1));border:1px solid var(--line);border-radius:20px;padding:30px;box-shadow:0 30px 80px #000c,inset 0 1px #ffffff10}
+.logo{font-size:34px;font-weight:700;letter-spacing:-.04em;background:linear-gradient(180deg,#fff,#777);-webkit-background-clip:text;background-clip:text;color:transparent}
+.seg{display:flex;background:var(--bg);border-radius:11px;padding:3px;margin:22px 0 16px}
+.seg button{flex:1;padding:8px;border-radius:9px;color:var(--mut);transition:.18s}
+.seg button.on{background:var(--s3);color:#fff}
+.fld{display:flex;flex-direction:column;gap:6px;margin-bottom:12px}
+.fld label{color:var(--mut);font-size:12px}
+.msg{min-height:20px;color:#ff8f8f;font-size:13px;margin:4px 0 10px}
+details summary{color:var(--mut);cursor:pointer;font-size:12px;margin:6px 0 10px}
+
+/* shell */
+#app{height:100%;display:flex;flex-direction:column}
+#tabs{display:flex;align-items:center;gap:4px;padding:8px 10px 0;background:var(--bg)}
+#tabList{display:flex;gap:4px;min-width:0;overflow:hidden;flex:0 1 auto}
+.tab{display:flex;align-items:center;gap:8px;min-width:60px;width:190px;flex:0 1 190px;height:34px;padding:0 6px 0 12px;border-radius:11px 11px 0 0;color:var(--mut);cursor:default;transition:background .18s,color .18s}
+.tab:hover{background:var(--s1);color:var(--tx)}
+.tab.on{background:var(--s2);color:#fff}
+.tab span.t{flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:13px}
+.tab .x{width:20px;height:20px;border-radius:6px;display:grid;place-items:center;flex:none}
+.tab .x:hover{background:var(--s4)}.tab .x svg{width:12px;height:12px}
+.tab.ld .t::before{content:"";display:inline-block;width:9px;height:9px;margin-right:7px;border:2px solid #fff3;border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+#bar{display:flex;align-items:center;gap:4px;padding:6px 10px;background:var(--s2);border-bottom:1px solid var(--line)}
+#addr{flex:1;display:flex;align-items:center;gap:8px;background:var(--bg);border:1px solid var(--line);border-radius:999px;padding:0 14px;height:36px;margin:0 6px;transition:.18s}
+#addr:focus-within{border-color:#fff4;box-shadow:0 0 0 4px #ffffff0d}
+#addr input{background:none;border:0;padding:0;border-radius:0;flex:1;min-width:0}
+#addr input:focus{background:none}
+#addr .ic{color:var(--mut)}
+#acct{position:relative}
+#av{width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,#fff,#555);color:#000;font-weight:700;display:grid;place-items:center;margin-left:4px}
+.menu{position:fixed;z-index:80;min-width:190px;background:var(--s2);border:1px solid var(--line);border-radius:var(--r);padding:5px;box-shadow:0 20px 50px #000d;animation:pop .14s var(--ease)}
+@keyframes pop{from{opacity:0;transform:translateY(-4px) scale(.98)}}
+.menu button,.menu .hd{display:block;width:100%;text-align:left;padding:8px 11px;border-radius:8px}
+.menu .hd{color:var(--mut);font-size:12px;cursor:default}
+.menu button:hover{background:var(--s4)}.menu hr{border:0;border-top:1px solid var(--line);margin:4px 0}
+
+/* view */
+#view{flex:1;position:relative;background:var(--bg);min-height:0}
+iframe.site{position:absolute;inset:0;width:100%;height:100%;border:0;background:#fff}
+#prog{position:absolute;top:0;left:0;height:2px;background:#fff;width:0;z-index:5;opacity:0;transition:width .4s,opacity .3s}
+#prog.go{opacity:1;width:70%;transition:width 12s cubic-bezier(.1,.7,.3,1)}
+#nt{position:absolute;inset:0;overflow:auto;display:flex;flex-direction:column;align-items:center;padding:12vh 20px 40px;background:radial-gradient(800px 420px at 50% 0,#171719,var(--bg) 70%)}
+#nt .logo{font-size:clamp(56px,10vw,96px);margin-bottom:26px}
+#ntf{width:min(640px,100%);display:flex;align-items:center;gap:10px;background:var(--s2);border:1px solid var(--line);border-radius:999px;padding:0 20px;height:56px;box-shadow:0 18px 50px #0008,inset 0 1px #ffffff0d;transition:.2s var(--ease)}
+#ntf:focus-within{border-color:#fff4;transform:translateY(-1px)}
+#ntf input{background:none;border:0;font-size:16px;padding:0;flex:1}
+#ntf input:focus{background:none}
+#eng{display:flex;gap:6px;margin:16px 0 44px;flex-wrap:wrap;justify-content:center}
+#eng button{padding:6px 13px;border-radius:999px;color:var(--mut);border:1px solid var(--line);font-size:13px;transition:.18s}
+#eng button:hover{color:#fff}#eng button.on{background:#f2f2f2;color:#000;border-color:#f2f2f2}
+#fav{display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:12px;width:min(720px,100%)}
+.fv{position:relative;display:flex;flex-direction:column;align-items:center;gap:10px;padding:18px 8px 14px;border-radius:16px;background:var(--s1);border:1px solid var(--line);transition:.2s var(--ease);cursor:pointer}
+.fv:hover{background:var(--s2);transform:translateY(-2px);border-color:#fff2}
+.fv .tile{width:44px;height:44px;border-radius:13px;background:linear-gradient(145deg,#3a3a3e,#161617);display:grid;place-items:center;font-weight:700;font-size:19px}
+.fv .nm{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
+.fv .ac{position:absolute;top:4px;right:4px;display:none;gap:0}
+.fv:hover .ac{display:flex}.fv .ac .ib{width:24px;height:24px;border-radius:7px}.fv .ac svg{width:12px;height:12px}
+.fv.add .tile{background:none;border:1px dashed #fff3;color:var(--mut)}
+#err{position:absolute;inset:0;z-index:4;background:var(--bg);display:grid;place-items:center;text-align:center;padding:24px}
+#err p{color:var(--mut);max-width:380px;margin:8px auto 20px;white-space:pre-line}
+#err h2{font-size:20px}
+
+/* panel / dialog */
+#shade{position:fixed;inset:0;background:#0009;z-index:60;animation:fade .2s}
+@keyframes fade{from{opacity:0}}
+#panel{position:fixed;top:0;right:0;bottom:0;width:min(440px,100vw);background:var(--s1);border-left:1px solid var(--line);z-index:61;display:flex;flex-direction:column;animation:slide .26s var(--ease)}
+@keyframes slide{from{transform:translateX(30px);opacity:0}}
+#panel header{display:flex;align-items:center;justify-content:space-between;padding:16px 18px;border-bottom:1px solid var(--line);font-size:16px;font-weight:600}
+#pb{flex:1;overflow:auto;padding:12px 14px}
+.row{display:flex;align-items:center;gap:6px;padding:8px 6px 8px 10px;border-radius:10px;cursor:pointer}
+.row:hover{background:var(--s2)}
+.row .tx{flex:1;min-width:0}.row .tx b{display:block;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .tx small{color:var(--mut);display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.empty{color:var(--mut);text-align:center;padding:40px 10px}
+.sec{margin-bottom:22px}.sec h3{font-size:12px;color:var(--mut);font-weight:500;margin-bottom:8px}
+#dlg{position:fixed;inset:0;display:grid;place-items:center;z-index:90;background:#000a}
+#dlg .card{padding:24px}
+#dlg .bt{display:flex;gap:8px;justify-content:flex-end;margin-top:6px}
+#toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--s3);border:1px solid var(--line);padding:10px 16px;border-radius:12px;z-index:99;box-shadow:0 14px 40px #000a;animation:pop .2s}
+
+/* fullscreen */
+body.fs #tabs,body.fs #bar{display:none}
+#xfs{position:fixed;top:10px;right:12px;z-index:70;background:#000b;border:1px solid var(--line);backdrop-filter:blur(8px);border-radius:999px;padding:7px 14px;font-size:13px;opacity:.35;transition:.2s}
+#xfs:hover{opacity:1}
+@media(max-width:640px){#tabs{padding-left:6px}.tab{width:120px;flex-basis:120px}#bar .hm,#bar .fsb{display:none}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+
+<!-- AUTH -->
+<div id="auth" class="hidden">
+  <form class="card" id="af" autocomplete="on">
+    <div class="logo">Veil</div>
+    <div class="seg"><button type="button" id="tLogin" class="on">Log in</button><button type="button" id="tReg">Create account</button></div>
+    <div class="fld"><label for="u">Username</label><input id="u" type="text" autocomplete="username" required minlength="3" maxlength="32"></div>
+    <div class="fld"><label for="p">Password</label><input id="p" type="password" autocomplete="current-password" required minlength="8" maxlength="128"></div>
+    <div class="fld hidden" id="kf"><label for="k">Invite key</label><input id="k" type="text" autocomplete="off" spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX-XXXX"></div>
+    <div class="msg" id="am" role="alert"></div>
+    <button class="btn pri" id="as" style="width:100%">Log in</button>
+    <div class="msg" id="sec" style="color:#e8c070;margin:14px 0 0"></div>
+    <details style="margin-top:16px"><summary>Proxy server</summary>
+      <input id="srv" type="url" placeholder="http://192.168.1.100:8000"></details>
+  </form>
+</div>
+
+<!-- APP -->
+<div id="app" class="hidden">
+  <div id="tabs">
+    <div id="tabList"></div>
+    <button class="ib ic" id="nb" title="New tab" aria-label="New tab"></button>
+    <div style="flex:1"></div>
+  </div>
+  <div id="bar">
+    <button class="ib ic" id="bk" title="Back" aria-label="Back"></button>
+    <button class="ib ic" id="fw" title="Forward" aria-label="Forward"></button>
+    <button class="ib ic" id="rl" title="Reload" aria-label="Reload"></button>
+    <button class="ib ic hm" id="hm" title="Home" aria-label="Home"></button>
+    <form id="addr" autocomplete="off"><span class="ic" id="aic"></span><input id="ai" type="text" placeholder="Search or enter address" spellcheck="false" aria-label="Address"></form>
+    <button class="ib ic" id="st" title="Bookmark this page" aria-label="Bookmark"></button>
+    <button class="ib ic fsb" id="fs" title="Fullscreen" aria-label="Fullscreen"></button>
+    <button id="av" title="Account" aria-label="Account menu"></button>
+  </div>
+  <div id="view">
+    <div id="prog"></div>
+    <div id="nt">
+      <div class="logo">Veil</div>
+      <form id="ntf"><span class="ic" id="nic" style="color:var(--mut)"></span><input id="nq" type="text" placeholder="Search the web or enter a URL" aria-label="Search"></form>
+      <div id="eng"></div>
+      <div id="fav"></div>
+    </div>
+    <div id="err" class="hidden"></div>
+  </div>
+</div>
+<button id="xfs" class="hidden">Exit fullscreen</button>
+<div id="ov"></div>
+
+<script>
+'use strict';
+const $=s=>document.querySelector(s);
+const IC={back:'M15 18l-6-6 6-6',fwd:'M9 6l6 6-6 6',reload:'M20 12a8 8 0 1 1-2.5-5.8M20 4v5h-5',home:'M4 11l8-7 8 7M6 10v9h12v-9',plus:'M12 5v14M5 12h14',full:'M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5',star:'M12 3l2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1L3.2 9.5l6.1-.9z',x:'M6 6l12 12M18 6L6 18',pen:'M4 20l4-1 11-11-3-3L5 16z',search:'M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM21 21l-5-5',lock:'M7 11V8a5 5 0 0 1 10 0v3M6 11h12v9H6z'};
+const icon=n=>`<svg viewBox="0 0 24 24"><path d="${IC[n]}"/></svg>`;
+function h(t,a={},...k){const e=document.createElement(t);for(const[n,v]of Object.entries(a)){if(n==='class')e.className=v;else if(n.startsWith('on'))e.addEventListener(n.slice(2),v);else if(v!==false&&v!=null)e.setAttribute(n,v)}for(const c of k.flat())if(c!=null)e.append(c.nodeType?c:document.createTextNode(c));return e}
+const ib=(n,title,fn,cls='')=>{const b=h('button',{class:'ib ic '+cls,title,'aria-label':title,onclick:fn});b.innerHTML=icon(n);return b};
+
+const ENGINES={google:['Google','https://www.google.com/search?q='],duckduckgo:['DuckDuckGo','https://duckduckgo.com/?q='],bing:['Bing','https://www.bing.com/search?q='],brave:['Brave Search','https://search.brave.com/search?q=']};
+const PRESETS=[['YouTube','https://www.youtube.com'],['Discord','https://discord.com/app'],['Reddit','https://www.reddit.com'],['ChatGPT','https://chatgpt.com'],['X / Twitter','https://x.com']];
+const DEFAULT_SERVER='https://desktop-imu64dc.tail6059cd.ts.net:8443/';
+const ls={get:k=>{try{return localStorage.getItem(k)||''}catch{return ''}},set:(k,v)=>{try{v?localStorage.setItem(k,v):localStorage.removeItem(k)}catch{}}};
+const S={base:(ls.get('veil.base')||DEFAULT_SERVER||(/^https?:/.test(location.protocol)?location.origin:'')).replace(/\/+$/,''),token:ls.get('veil.token'),csrf:'',user:null,set:{search_engine:'google',preferences:{}},bm:[],tabs:[],active:null,tid:0,fs:false};
+
+/* ---------- API ---------- */
+class ApiErr extends Error{constructor(m,s){super(m);this.status=s}}
+async function api(path,{method='GET',body}={}){
+  let r;
+  if(!S.base)throw new ApiErr('Enter the proxy server address first.',0);
+  try{r=await fetch(S.base+path,{method,headers:{...(body?{'Content-Type':'application/json'}:{}),...(S.token?{Authorization:'Bearer '+S.token}:{})},body:body?JSON.stringify(body):undefined})}
+  catch{throw new ApiErr(navigator.onLine?'Sorry, the proxy is unavailable at the moment.':'No internet connection.',0)}
+  let d=null;try{d=await r.json()}catch{}
+  if(r.status===401&&S.user){S.user=null;S.token='';ls.set('veil.token','');showAuth('Your session has expired. Please log in again.')}
+  if(!r.ok)throw new ApiErr(r.status===429?'Too many requests. Please wait a moment and try again.':(d&&d.error)||'Something went wrong. Please try again.',r.status);
+  return d}
+function toast(m){document.querySelector('#toast')?.remove();const t=h('div',{id:'toast',role:'status'},m);document.body.append(t);setTimeout(()=>t.remove(),3200)}
+const fail=e=>toast(e.message||'Something went wrong.');
+
+/* ---------- auth ---------- */
+let mode='login';
+function setMode(m){mode=m;$('#tLogin').classList.toggle('on',m==='login');$('#tReg').classList.toggle('on',m==='reg');$('#as').textContent=m==='login'?'Log in':'Create account';$('#p').autocomplete=m==='login'?'current-password':'new-password';$('#am').textContent='';$('#kf').classList.toggle('hidden',m!=='reg');$('#k').required=m==='reg'}
+function showAuth(msg=''){$('#app').classList.add('hidden');$('#auth').classList.remove('hidden');$('#srv').value=S.base;if(!S.base)document.querySelector('#af details').open=true;chkSec();$('#am').textContent=msg;closeOv();exitFs()}
+const PRIV=/^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.)/;
+function chkSec(){const v=($('#srv').value||S.base||'').trim();let m='';try{const u=new URL(/^https?:\/\//i.test(v)?v:'https://'+v);if(u.protocol==='http:'&&!PRIV.test(u.hostname))m='This server address is not encrypted (http://). Use https:// before entering a password.'}catch{}$('#sec').textContent=m}
+$('#srv').addEventListener('input',chkSec);
+$('#tLogin').onclick=()=>setMode('login');$('#tReg').onclick=()=>setMode('reg');
+$('#af').onsubmit=async e=>{e.preventDefault();const b=$('#as');b.disabled=true;$('#am').textContent='';
+  let srv=$('#srv').value.trim().replace(/\/+$/,'');if(srv&&!/^https?:\/\//i.test(srv))srv='https://'+srv;if(srv&&srv!==S.base){S.base=srv;ls.set('veil.base',srv)}
+  if(!S.base){$('#am').textContent='Enter the proxy server address below.';b.disabled=false;return}
+  const body={username:$('#u').value.trim(),password:$('#p').value};
+  try{if(mode==='reg')await api('/api/auth/register',{method:'POST',body:{...body,key:$('#k').value.trim()}});
+    const d=await api('/api/auth/login',{method:'POST',body});S.token=d.token||'';ls.set('veil.token',S.token);$('#p').value='';await start(d)}
+  catch(x){$('#am').textContent=x.message}finally{b.disabled=false}};
+
+async function start(me){
+  S.user=me.username;S.csrf=me.csrf_token||'';S.pb=me.proxy_base||'';
+  const [set,bm]=await Promise.all([api('/api/settings'),api('/api/bookmarks')]);
+  S.set={search_engine:'google',preferences:{},...set};S.set.preferences=S.set.preferences||{};S.bm=bm||[];
+  if(!S.set.preferences.seeded&&!S.bm.length){for(const[n,u]of PRESETS){try{S.bm.push(await api('/api/bookmarks',{method:'POST',body:{name:n,url:u}}))}catch{}}
+    S.set.preferences.seeded=true;api('/api/settings',{method:'PATCH',body:{preferences:S.set.preferences}}).catch(()=>{})}
+  $('#auth').classList.add('hidden');$('#app').classList.remove('hidden');$('#av').textContent=S.user[0].toUpperCase();
+  S.tabs.forEach(t=>t.frame?.remove());S.tabs=[];newTab();renderNT()}
+async function logout(){try{await api('/api/auth/logout',{method:'POST'})}catch{}S.user=null;S.csrf='';S.token='';ls.set('veil.token','');showAuth()}
+
+/* ---------- URL handling ---------- */
+function normalize(v){v=v.trim();if(!v)return'';
+  if(/^https?:\/\//i.test(v))return v;
+  if(!/\s/.test(v)&&/^(localhost|(\d{1,3}\.){3}\d{1,3}|[\w-]+(\.[\w-]+)*\.[a-z]{2,})(:\d+)?([/?#].*)?$/i.test(v))return(/^(localhost|\d{1,3}(\.\d{1,3}){3})/.test(v)?'http://':'https://')+v;
+  return ENGINES[S.set.search_engine][1]+encodeURIComponent(v)}
+const host=u=>{try{return new URL(u).hostname.replace(/^www\./,'')}catch{return u}};
+
+/* ---------- tabs ---------- */
+const cur=()=>S.tabs.find(t=>t.id===S.active);
+function newTab(url){const t={id:++S.tid,url:'',title:'New Tab',hist:[],i:-1,frame:null,err:null,loading:false};S.tabs.push(t);activate(t.id);if(url)go(t,url);return t}
+function activate(id){S.active=id;renderTabs();renderView();syncBar()}
+function closeTab(id){const i=S.tabs.findIndex(t=>t.id===id);if(i<0)return;S.tabs[i].frame?.remove();clearTimeout(S.tabs[i].timer);S.tabs.splice(i,1);
+  if(!S.tabs.length)return newTab();if(S.active===id)activate(S.tabs[Math.min(i,S.tabs.length-1)].id);else renderTabs()}
+function go(t,input,o={}){if(!input)return;const u=normalize(input);
+  if(!navigator.onLine){t.err={msg:'No internet connection.'};renderView();return}
+  if(o.push!==false){t.hist=t.hist.slice(0,t.i+1);t.hist.push(u);t.i=t.hist.length-1}
+  t.url=u;t.title=host(u);load(t);renderTabs();syncBar()}
+function load(t){t.err=null;t.loading=true;clearTimeout(t.timer);
+  const src=S.pb+'/?url='+encodeURIComponent(t.url);
+  if(!t.frame){t.frame=h('iframe',{class:'site',src,allow:'fullscreen; autoplay; clipboard-write; encrypted-media',referrerpolicy:'no-referrer'});t.frame.addEventListener('load',()=>onLoad(t));$('#view').append(t.frame)}
+  else t.frame.src=src;
+  t.timer=setTimeout(()=>timedOut(t),30000);renderView();renderTabs()}
+async function timedOut(t){if(!t.loading)return;t.loading=false;
+  try{await api('/api/auth/me');t.err={msg:'The website took too long to respond.'}}catch(e){t.err={msg:e.message}}renderView();renderTabs()}
+function onLoad(t){if(!t.loading)return;clearTimeout(t.timer);t.loading=false;renderTabs();renderView();
+  setTimeout(()=>{if(t.url&&!t.err)api('/api/history',{method:'POST',body:{url:t.url,title:t.title}}).catch(()=>{})},400)}
+const ERRS={session:'Your session has expired. Please log in again.',ratelimit:'Too many requests. Please wait a moment and try again.',unreachable:"This website couldn't be reached.\nThe destination server may be unavailable or blocking the request.",timeout:'The website took too long to respond.',blocked:"This website can't be displayed through the proxy.\nIt may block embedding or require features the proxy can't provide."};
+addEventListener('message',e=>{const t=S.tabs.find(t=>t.frame&&t.frame.contentWindow===e.source),d=e.data;if(!t||!d||typeof d!=='object')return;
+  if(d.type==='proxy-nav'&&typeof d.url==='string'){if(d.title)t.title=String(d.title).slice(0,200);
+    if(d.url!==t.url){if(t.hist[t.i]!==d.url){t.hist=t.hist.slice(0,t.i+1);t.hist.push(d.url);t.i++}t.url=d.url}
+    renderTabs();if(t.id===S.active)syncBar()}
+  else if(d.type==='proxy-error'){t.loading=false;clearTimeout(t.timer);t.err={msg:ERRS[d.code]||'Something went wrong while loading this page.'};renderTabs();renderView()}});
+function back(){const t=cur();if(t&&t.i>0){t.i--;go(t,t.hist[t.i],{push:false})}}
+function fwd(){const t=cur();if(t&&t.i<t.hist.length-1){t.i++;go(t,t.hist[t.i],{push:false})}}
+function reload(t=cur()){if(t?.url)load(t)}
+function home(){const t=cur();if(!t)return;t.url='';t.err=null;t.loading=false;t.title='New Tab';t.frame?.remove();t.frame=null;clearTimeout(t.timer);renderTabs();renderView();syncBar();$('#nq').focus()}
+
+function renderTabs(){const l=$('#tabList');l.replaceChildren(...S.tabs.map(t=>{
+  const x=h('button',{class:'x ic',title:'Close tab','aria-label':'Close tab',onclick:e=>{e.stopPropagation();closeTab(t.id)}});x.innerHTML=icon('x');
+  return h('div',{class:'tab'+(t.id===S.active?' on':'')+(t.loading?' ld':''),onclick:()=>activate(t.id),onauxclick:e=>{if(e.button===1)closeTab(t.id)},oncontextmenu:e=>{e.preventDefault();tabMenu(e,t)}},h('span',{class:'t'},t.title||'New Tab'),x)}))}
+function renderView(){const t=cur();if(!t)return;
+  $('#nt').classList.toggle('hidden',!!t.url);
+  S.tabs.forEach(o=>{if(o.frame)o.frame.classList.toggle('hidden',o!==t)});
+  const e=$('#err');e.classList.toggle('hidden',!t.err);
+  if(t.err){const[a,...b]=t.err.msg.split('\n');e.replaceChildren(h('div',{},h('h2',{},a),h('p',{},b.join('\n')),h('button',{class:'btn pri',onclick:()=>t.url?load(t):renderView()},'Retry')))}
+  const p=$('#prog');p.classList.remove('go');void p.offsetWidth;if(t.loading)p.classList.add('go')}
+function syncBar(){const t=cur();if(!t)return;$('#ai').value=t.url;$('#bk').disabled=!(t.i>0);$('#fw').disabled=!(t.i<t.hist.length-1);$('#rl').disabled=!t.url;
+  $('#st').classList.toggle('on',!!t.url&&S.bm.some(b=>b.url===t.url));$('#aic').innerHTML=icon(t.url?'lock':'search')}
+
+/* ---------- new tab page ---------- */
+function renderNT(){
+  $('#eng').replaceChildren(...Object.entries(ENGINES).map(([k,[n]])=>h('button',{class:k===S.set.search_engine?'on':'',onclick:()=>setEngine(k)},n)));
+  const f=S.bm.map(b=>{const c=h('div',{class:'fv',tabindex:0,role:'link',onclick:()=>go(cur(),b.url),onkeydown:e=>{if(e.key==='Enter')go(cur(),b.url)}},
+      h('div',{class:'ac'},ib('pen','Edit',e=>{e.stopPropagation();editBm(b)}),ib('x','Remove',e=>{e.stopPropagation();delBm(b)})),
+      h('div',{class:'tile'},(b.name||'?')[0].toUpperCase()),h('div',{class:'nm'},b.name));return c});
+  const add=h('div',{class:'fv add',tabindex:0,onclick:()=>editBm(null),onkeydown:e=>{if(e.key==='Enter')editBm(null)}},h('div',{class:'tile'},'+'),h('div',{class:'nm'},'Add favorite'));
+  $('#fav').replaceChildren(...f,add)}
+async function setEngine(k){S.set.search_engine=k;renderNT();try{await api('/api/settings',{method:'PATCH',body:{search_engine:k}})}catch(e){fail(e)}}
+
+/* ---------- bookmarks ---------- */
+async function saveBm(b,name,url){url=normalize(url);if(!/^https?:\/\//i.test(url))url=normalize(url);
+  try{if(b){const r=await api('/api/bookmarks/'+b.id,{method:'PATCH',body:{name,url}});Object.assign(b,r&&r.id?r:{name,url})}
+    else S.bm.push(await api('/api/bookmarks',{method:'POST',body:{name,url}}));renderNT();syncBar();if($('#panel'))panelBookmarks()}catch(e){fail(e)}}
+function editBm(b,pre){dialog(b?'Edit favorite':'Add favorite',[['Name',b?b.name:pre?.name||''],['Address',b?b.url:pre?.url||'']],v=>saveBm(b,v[0],v[1]))}
+async function delBm(b){try{await api('/api/bookmarks/'+b.id,{method:'DELETE'});S.bm=S.bm.filter(x=>x!==b);renderNT();syncBar();if($('#panel'))panelBookmarks()}catch(e){fail(e)}}
+function toggleBm(t=cur()){if(!t?.url)return toast('Open a page first to bookmark it.');const b=S.bm.find(x=>x.url===t.url);
+  if(b)delBm(b);else saveBm(null,t.title||host(t.url),t.url).then(()=>toast('Added to favorites'))}
+
+/* ---------- overlays ---------- */
+function closeOv(){$('#ov').replaceChildren();document.querySelectorAll('.menu').forEach(m=>m.remove())}
+function dialog(title,fields,ok){closeMenus();const inp=fields.map(([l,v])=>h('input',{type:'text',value:v,'aria-label':l,placeholder:l}));
+  const done=()=>{closeOv();ok(inp.map(i=>i.value.trim()))};
+  const f=h('form',{class:'card',onsubmit:e=>{e.preventDefault();if(inp.every(i=>i.value.trim()))done()}},h('h2',{style:'margin-bottom:14px;font-size:18px'},title),...fields.map(([l],i)=>h('div',{class:'fld'},h('label',{},l),inp[i])),
+    h('div',{class:'bt'},h('button',{type:'button',class:'btn',onclick:closeOv},'Cancel'),h('button',{class:'btn pri'},'Save')));
+  $('#ov').replaceChildren(h('div',{id:'dlg',onmousedown:e=>{if(e.target.id==='dlg')closeOv()}},f));inp[0].focus()}
+function panel(title,body){closeMenus();$('#ov').replaceChildren(h('div',{id:'shade',onclick:closeOv}),h('aside',{id:'panel','aria-label':title},h('header',{},title,ib('x','Close',closeOv)),h('div',{id:'pb'},body)))}
+function closeMenus(){document.querySelectorAll('.menu').forEach(m=>m.remove())}
+function menu(x,y,items){closeMenus();const m=h('div',{class:'menu'},...items.map(i=>i==='-'?h('hr'):i.hd?h('div',{class:'hd'},i.hd):h('button',{onclick:()=>{closeMenus();i.fn()}},i.t)));document.body.append(m);
+  const r=m.getBoundingClientRect();m.style.left=Math.max(6,Math.min(x,innerWidth-r.width-6))+'px';m.style.top=Math.max(6,Math.min(y,innerHeight-r.height-6))+'px'}
+function tabMenu(e,t){menu(e.clientX,e.clientY,[{t:'Reload',fn:()=>reload(t)},{t:'Close Tab',fn:()=>closeTab(t.id)},
+  {t:'Close Other Tabs',fn:()=>{S.tabs.filter(o=>o!==t).forEach(o=>closeTab(o.id));activate(t.id)}},
+  {t:'Close Tabs to the Right',fn:()=>{const i=S.tabs.indexOf(t);S.tabs.slice(i+1).forEach(o=>closeTab(o.id))}},'-',
+  {t:'Fullscreen Tab',fn:()=>{activate(t.id);enterFs()}},{t:'Add to Favorites',fn:()=>t.url?toggleBmAdd(t):editBm(null)}])}
+function toggleBmAdd(t){if(S.bm.some(b=>b.url===t.url))toast('Already in favorites');else saveBm(null,t.title||host(t.url),t.url).then(()=>toast('Added to favorites'))}
+
+/* history */
+async function panelHistory(){const body=h('div',{},h('div',{class:'empty'},'Loading…'));panel('History',body);
+  try{const rows=await api('/api/history');const fmt=s=>{const d=new Date(s),n=new Date(),tm=d.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'});return d.toDateString()===n.toDateString()?'Today, '+tm:d.toLocaleDateString([],{month:'short',day:'numeric'})+', '+tm};
+    const render=()=>{body.replaceChildren(rows.length?h('button',{class:'btn dng',style:'margin:0 0 10px',onclick:async()=>{try{await api('/api/history',{method:'DELETE'});rows.length=0;render()}catch(e){fail(e)}}},'Clear all history'):'',
+      ...(rows.length?rows.map(r=>h('div',{class:'row',onclick:()=>{closeOv();go(cur(),r.url)}},h('div',{class:'tx'},h('b',{},r.title||r.domain||r.url),h('small',{},(r.domain||host(r.url))+' · '+fmt(r.visited_at))),
+        ib('x','Delete entry',async e=>{e.stopPropagation();try{await api('/api/history/'+r.id,{method:'DELETE'});rows.splice(rows.indexOf(r),1);render()}catch(x){fail(x)}}))):[h('div',{class:'empty'},'No history yet. Pages you visit will show up here.')]))};render()}
+  catch(e){body.replaceChildren(h('div',{class:'empty'},e.message))}}
+function panelBookmarks(){const body=S.bm.length?S.bm.map(b=>h('div',{class:'row',onclick:()=>{closeOv();go(cur(),b.url)}},h('div',{class:'tx'},h('b',{},b.name),h('small',{},b.url)),ib('pen','Edit',e=>{e.stopPropagation();editBm(b)}),ib('x','Remove',e=>{e.stopPropagation();delBm(b)}))):[h('div',{class:'empty'},'No favorites yet.')];
+  panel('Favorites',h('div',{},h('button',{class:'btn',style:'margin-bottom:10px',onclick:()=>editBm(null)},'Add favorite'),...body))}
+function panelSettings(){const srv=h('input',{type:'url',value:S.base,placeholder:'http://192.168.1.100:8000'}),sel=h('select',{},...Object.entries(ENGINES).map(([k,[n]])=>h('option',{value:k,selected:k===S.set.search_engine?'':null},n)));
+  panel('Settings',h('div',{},
+    h('div',{class:'sec'},h('h3',{},'Proxy server'),srv,h('button',{class:'btn',style:'margin-top:8px',onclick:()=>{const v=srv.value.trim().replace(/\/+$/,'');if(!/^https?:\/\//i.test(v))return toast('Enter a full address, like http://192.168.1.100:8000');S.base=v;ls.set('veil.base',v);toast('Server saved. Open pages will use it on reload.')}},'Save server')),
+    h('div',{class:'sec'},h('h3',{},'Search engine'),sel,h('button',{class:'btn',style:'margin-top:8px',onclick:()=>{setEngine(sel.value);toast('Search engine saved')}},'Save search engine')),
+    h('div',{class:'sec'},h('h3',{},'Website data'),h('p',{style:'color:var(--mut);margin-bottom:8px'},'Signs you out of websites you logged into through the proxy.'),
+      h('button',{class:'btn dng',onclick:async()=>{try{await api('/api/site-data',{method:'DELETE'});toast('Site data cleared')}catch(e){fail(e)}}},'Clear site data'))))}
+
+/* ---------- fullscreen ---------- */
+function enterFs(){S.fs=true;document.body.classList.add('fs');$('#xfs').classList.remove('hidden');document.documentElement.requestFullscreen?.().catch(()=>{})}
+function exitFs(){if(!S.fs)return;S.fs=false;document.body.classList.remove('fs');$('#xfs').classList.add('hidden');if(document.fullscreenElement)document.exitFullscreen().catch(()=>{})}
+document.addEventListener('fullscreenchange',()=>{if(!document.fullscreenElement)exitFs()});
+$('#xfs').onclick=exitFs;
+
+/* ---------- wiring ---------- */
+[['#nb','plus'],['#bk','back'],['#fw','fwd'],['#rl','reload'],['#hm','home'],['#st','star'],['#fs','full']].forEach(([s,n])=>$(s).innerHTML=icon(n));
+$('#nic').innerHTML=icon('search');
+$('#nb').onclick=()=>{newTab();$('#nq').focus()};$('#bk').onclick=back;$('#fw').onclick=fwd;$('#rl').onclick=()=>reload();$('#hm').onclick=home;$('#st').onclick=()=>toggleBm();$('#fs').onclick=enterFs;
+$('#addr').onsubmit=e=>{e.preventDefault();const t=cur();go(t,$('#ai').value);$('#ai').blur()};
+$('#ai').onfocus=e=>e.target.select();
+$('#ntf').onsubmit=e=>{e.preventDefault();const v=$('#nq').value;$('#nq').value='';go(cur(),v)};
+$('#av').onclick=e=>{const r=e.currentTarget.getBoundingClientRect();menu(r.right-190,r.bottom+6,[{hd:'Signed in as '+S.user},'-',{t:'History',fn:panelHistory},{t:'Favorites',fn:panelBookmarks},{t:'Settings',fn:panelSettings},'-',{t:'Sign out',fn:logout}]);e.stopPropagation()};
+document.addEventListener('mousedown',e=>{if(!e.target.closest('.menu')&&e.target.id!=='av')closeMenus()});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeMenus();if($('#ov').firstChild)closeOv()}});
+addEventListener('offline',()=>toast('No internet connection.'));
+
+(async()=>{setMode('login');
+  if(!S.base)return showAuth('Enter the proxy server address to get started.');
+  if(!S.token)return showAuth('');
+  try{await start(await api('/api/auth/me'))}
+  catch(e){if(e.status===401){S.token='';ls.set('veil.token','')}showAuth(e.status===401?'':e.message)}})();
+</script>
+</body>
+</html>
